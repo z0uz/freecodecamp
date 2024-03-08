@@ -1,41 +1,43 @@
 require('dotenv').config();
 const express = require('express');
+const bodyParser = require('body-parser');
+const expect = require('chai');
+const socket = require('socket.io');
 const helmet = require('helmet');
-const cors = require('cors');
+const nocache = require("nocache");
+const compression  = require('compression');
+const cors  = require('cors');
 
 const fccTestingRoutes = require('./routes/fcctesting.js');
 const runner = require('./test-runner.js');
 
 const app = express();
 
-// Replaces bodyParser with express built-in middleware as bodyParser is deprecated
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(cors());
 
-// Helmet configs for security headers
-app.use(helmet.xssFilter());
-app.use(helmet.noSniff());
-app.use(helmet.noCache());
-app.use((req, res, next) => {
-  res.setHeader("X-Powered-By", "PHP 7.4.3");
-  next();
-});
+app.use(compression())// compress all responses before server sends them to make site faster
 
 app.use('/public', express.static(process.cwd() + '/public'));
 app.use('/assets', express.static(process.cwd() + '/assets'));
 
-// For FCC testing purposes and enables user to connect from outside the hosting platform
-app.use(cors({origin: '*'}));
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// Cybersecurity
+app.use(helmet.noSniff());
+app.use(helmet.xssFilter());
+app.use(nocache());
+app.use(helmet.hidePoweredBy( {setTo: 'PHP 7.4.3'} ));
 
 // Index page (static HTML)
 app.route('/')
   .get(function (req, res) {
     res.sendFile(process.cwd() + '/views/index.html');
-  });
+  }); 
 
-// For FCC testing purposes
+//For FCC testing purposes
 fccTestingRoutes(app);
-
+    
 // 404 Not Found Middleware
 app.use(function(req, res, next) {
   res.status(404)
@@ -61,49 +63,115 @@ const server = app.listen(portNum, () => {
   }
 });
 
-// Socket.io setup for real-time communication
-const socket = require('socket.io');
+// Socket.io setup:
+const Player = require('./public/Player');
+const Collectible = require('./public/Collectible');
+const {dimension} = require('./public/dimension');
+
+const random = (min, max) => {
+      return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+const getRandomPosition = () => {
+  let x = random(dimension.minX+50, dimension.maxX-50);
+  let y = random(dimension.minY+50, dimension.maxY-50);
+  x = Math.floor(x/10) * 10;
+  y = Math.floor(y/10) * 10;
+
+  return [x,y];
+}
+
+let playersList = [];
+let [beerX,beerY] = getRandomPosition();
+let beer = new Collectible({x:beerX,y:beerY,value:1, id:Date.now()})
+let [bouncerX,bouncerY] = getRandomPosition();
+let bouncer = new Player({x:bouncerX,y:bouncerY,value:1, id:Date.now()});
+let connections = [];
+
+
 const io = socket(server);
+io.sockets.on('connection', socket => {
+  console.log(`New connection ${socket.id}`);
+  connections.push(socket);
+  console.log('Connected: %s sockets connected.',connections.length);
 
-let gameState = {
-  players: [],
-  collectible: getNewCollectable()
-}
+  let [positionX,positionY] = getRandomPosition();
+  let player = new Player({x:positionX,y:positionY,score:0,id:socket.id});
 
-function getNewCollectable() {
-  const randX = Math.floor(Math.random() * 420 + 20);
-  const randY = Math.floor(Math.random() * 440 + 20);
-  const randId = Math.floor(Math.random() * 999999999);
-  return {x: randX, y: randY, value: 1, id: randId};
-}
+  playersList.push(player)
 
-io.on('connection', client => {
-  client.emit('init', "YOU ARE CONNECTED!");
+  socket.emit('init', {id: socket.id, players: playersList, beer: beer, bouncer:bouncer});
 
-  client.on('updatePlayer', playerObj => {
-    // Update or add the player in one step, checking for presence more efficiently
-    const playerIndex = gameState.players.findIndex(player => player.playerObj.id === playerObj.playerObj.id);
-
-    if (playerIndex !== -1) {
-      gameState.players[playerIndex] = playerObj;
-    } else {
-      gameState.players.push(playerObj);
-    }
-
-    io.emit('updatedGameState', gameState);
+  socket.on('update', (updatedUser) => {
+      playersList.forEach(user => {
+          if(user.id === socket.id){
+              user.x = updatedUser.x;
+              user.y = updatedUser.y;
+              user.score = updatedUser.score;
+              user.radius = updatedUser.radius;
+          }
+      });
+      io.emit('update', {players: playersList,bouncer:bouncer,beer:beer,player: null});
   });
 
-  client.on('refresh-collectible', (boolean) => {
-    if (boolean) {
-      gameState.collectible = getNewCollectable();
-      io.emit('updatedGameState', gameState);
-    }
+  socket.on('disconnect', () => {
+    console.log(`deconnection ${socket.id}`);
+    socket.broadcast.emit('remove-player', socket.id);
+    connections.splice(connections.indexOf(socket), 1);
+    playersList = playersList.filter(player => player.id !== socket.id);
+    console.log('Disconnected: %s sockets connected.', connections.length);
   });
-
-  client.on('disconnect', () => {
-    gameState.players = gameState.players.filter(player => player.playerObj.id !== client.id);
-    io.emit('updatedGameState', gameState);
-  });
+  
 });
+
+var interval = setInterval(draw, 1000/50); 
+let vx = 2;
+let vy = 2;
+function draw() {
+    // move the bouncer
+    if(bouncer.x+ bouncer.radius > dimension.maxX) vx = -vx;
+    if(bouncer.y+ bouncer.radius > dimension.maxY) vy = -vy;
+    if(bouncer.x-bouncer.radius <= dimension.minX) vx = -vx;
+    if(bouncer.y-bouncer.radius <= dimension.minY) vy = -vy;
+    bouncer.x += vx;
+    bouncer.y += vy;
+    let playerUpdate = null
+
+    playersList.forEach(player => {
+      if(bouncer.collision(player)) {
+        let [positionX,positionY] = getRandomPosition();
+        player.x = positionX;
+        player.y = positionY;
+        player.score -= 20;
+        playerUpdate = player;
+        if (player.score <= -60) {
+          io.emit("lost", player.id, interval);
+        }
+
+      }
+      let p = new Player(player);
+      if (p.collision(beer)) {
+        player.score += 10;
+        let [beerX,beerY] = getRandomPosition();
+        beer = new Collectible({x:beerX,y:beerY,value:1, id:Date.now()})
+        playerUpdate = player;
+        if (player.score >= 30) {
+          io.emit("won", player.id, interval);
+        }
+
+      }
+    });
+
+
+    io.emit('update', {
+      players: playersList,
+      bouncer:bouncer,
+      beer: beer,
+      player: playerUpdate
+    });
+
+
+}
+
 
 module.exports = app; // For testing
